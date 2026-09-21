@@ -2,9 +2,11 @@ import React, { useState, useEffect, useRef } from 'react';
 import './App.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
-const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC || 'innsub5';
+// TOPIC SEPARATION
+const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC || 'innsub5'; // Topic sent to hardware
+const SUB_TOPIC = import.meta.env.VITE_STATUS_TOPIC || 'otto7';     // Topic received from hardware
 
-// Updated command mappings per your specs
+// Board 2 Switch Mappings
 const ON_KEYS = ["1", "2", "5", "6", "7"];
 const OFF_KEYS = ["a", "b", "e", "f", "g"];
 
@@ -44,7 +46,7 @@ function App() {
       }
       return true;
     } catch (err) { 
-      console.error("Command failed"); 
+      console.error("Command failed", err); 
       return false;
     }
   };
@@ -72,7 +74,8 @@ function App() {
     const listenForUpdates = async () => {
       abortControllerRef.current = new AbortController();
       try {
-        const res = await fetch(`${API_BASE_URL}/latest-updates?topic=${encodeURIComponent(PUB_TOPIC)}`, {
+        // FIX 1: Poll using SUB_TOPIC ('otto7') instead of PUB_TOPIC ('innsub5')
+        const res = await fetch(`${API_BASE_URL}/latest-updates?topic=${encodeURIComponent(SUB_TOPIC)}`, {
           signal: abortControllerRef.current.signal
         });
 
@@ -97,7 +100,9 @@ function App() {
             return newState;
           });
         }
-        listenForUpdates();
+        
+        // Immediate next poll if connection closes normally
+        if (isMounted) listenForUpdates();
       } catch (err) {
         if (isMounted && err.name !== 'AbortError') {
           setTimeout(listenForUpdates, 3000);
@@ -105,6 +110,7 @@ function App() {
       }
     };
 
+    // Send initial status request command
     sendSecureCommand(PUB_TOPIC, "0");
     listenForUpdates();
 
@@ -118,22 +124,27 @@ function App() {
     e.preventDefault();
     setErrorMsg('');
     try {
+      // FIX 2: Pass boardId so server evaluates MASTER_PASS_BOARD2
       const res = await fetch(`${API_BASE_URL}/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password })
+        body: JSON.stringify({ 
+          password,
+          boardId: 'otto7'
+        })
       });
       const data = await res.json();
       if (data.token) {
         localStorage.setItem('kameha_token', data.token);
         setIsAuthenticated(true);
       } else {
-        setErrorMsg('Invalid Master Password');
+        setErrorMsg(data.error || 'Invalid Master Password');
       }
     } catch (err) { setErrorMsg("Auth Server Offline"); }
   };
 
   const handleToggle = (i) => {
+    if (boardStatus === 'offline') return;
     const newState = !deviceStates[i];
     setDeviceStates(prev => { const n = [...prev]; n[i] = newState; return n; });
     sendSecureCommand(PUB_TOPIC, newState ? ON_KEYS[i] : OFF_KEYS[i]);
@@ -161,9 +172,11 @@ function App() {
           )}
           <form onSubmit={login} className="login-form">
             <input 
-              type="password" placeholder="MASTER PASS" 
+              type="password" 
+              placeholder="MASTER PASS" 
               className="m-btn login-input"
-              value={password} onChange={(e) => setPassword(e.target.value)}
+              value={password} 
+              onChange={(e) => setPassword(e.target.value)}
             />
             <button type="submit" className="m-btn login-submit">ACCESS</button>
           </form>
@@ -183,8 +196,22 @@ function App() {
         </header>
 
         <div className="master-controls" style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
-          <button onClick={allOn} className="m-btn" style={{ flex: 1, padding: '12px' }}>ALL ON</button>
-          <button onClick={allOff} className="m-btn" style={{ flex: 1, padding: '12px' }}>ALL OFF</button>
+          <button 
+            onClick={allOn} 
+            className="m-btn" 
+            style={{ flex: 1, padding: '12px' }}
+            disabled={boardStatus === 'offline'}
+          >
+            ALL ON
+          </button>
+          <button 
+            onClick={allOff} 
+            className="m-btn" 
+            style={{ flex: 1, padding: '12px' }}
+            disabled={boardStatus === 'offline'}
+          >
+            ALL OFF
+          </button>
         </div>
 
         <div className={`grid-container ${boardStatus}`}>
