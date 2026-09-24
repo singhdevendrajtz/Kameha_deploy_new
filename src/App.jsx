@@ -1,27 +1,28 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
+import { io } from 'socket.io-client';
 import './App.css';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
-// TOPIC SEPARATION
-const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC || 'innsub5'; // Topic sent to hardware
-const SUB_TOPIC = import.meta.env.VITE_STATUS_TOPIC || 'otto7';     // Topic received from hardware
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "https://kameha.in:5000/api";
+const PUB_TOPIC = import.meta.env.VITE_HARDWARE_TOPIC || 'innsub5';
+const SUB_TOPIC = import.meta.env.VITE_STATUS_TOPIC || 'otto7';
 
-// Board 2 Switch Mappings
 const ON_KEYS = ["1", "2", "5", "6", "7"];
 const OFF_KEYS = ["a", "b", "e", "f", "g"];
 
-function App() {
-  const [isAuthenticated, setIsAuthenticated] = useState(!!localStorage.getItem('kameha_token'));
+export default function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(Boolean(localStorage.getItem('kameha_token')));
   const [password, setPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState(''); 
-  const [deviceStates, setDeviceStates] = useState(new Array(5).fill(false));
+  const [deviceStates, setDeviceStates] = useState([false, false, false, false, false]);
   const [boardStatus, setBoardStatus] = useState('offline');
-  const abortControllerRef = useRef(null);
 
   const baseUrl = import.meta.env.BASE_URL;
 
-  const logout = (isExpired = false) => {
-    if (abortControllerRef.current) abortControllerRef.current.abort();
+  const getSocketUrl = function(url) {
+    return url.replace(/\/api\/?$/, '');
+  };
+
+  const logout = function(isExpired) {
     localStorage.removeItem('kameha_token');
     setIsAuthenticated(false);
     if (isExpired) {
@@ -29,16 +30,16 @@ function App() {
     }
   };
 
-  const sendSecureCommand = async (topic, message) => {
+  const sendSecureCommand = async function(topic, message) {
     const token = localStorage.getItem('kameha_token');
     try {
-      const res = await fetch(`${API_BASE_URL}/command`, {
+      const res = await fetch(API_BASE_URL + '/command', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`
+          'Authorization': 'Bearer ' + token
         },
-        body: JSON.stringify({ topic, message })
+        body: JSON.stringify({ topic: topic, message: message })
       });
 
       if (res.status === 401 || res.status === 403) {
@@ -46,91 +47,81 @@ function App() {
       }
       return true;
     } catch (err) { 
-      console.error("Command failed", err); 
+      console.error("Command failed", err);
       return false;
     }
   };
 
-  const allOn = async () => {
-    setDeviceStates(new Array(5).fill(true));
-    for (const key of ON_KEYS) {
-      await sendSecureCommand(PUB_TOPIC, key);
-      await new Promise(resolve => setTimeout(resolve, 30));
+  // Increased delay from 30ms to 150ms so ESP buffer doesn't overflow
+  const allOn = async function() {
+    for (let i = 0; i < ON_KEYS.length; i++) {
+      await sendSecureCommand(PUB_TOPIC, ON_KEYS[i]);
+      await new Promise(function(resolve) { setTimeout(resolve, 150); });
     }
   };
 
-  const allOff = async () => {
-    setDeviceStates(new Array(5).fill(false));
-    for (const key of OFF_KEYS) {
-      await sendSecureCommand(PUB_TOPIC, key);
-      await new Promise(resolve => setTimeout(resolve, 30));
+  const allOff = async function() {
+    for (let i = 0; i < OFF_KEYS.length; i++) {
+      await sendSecureCommand(PUB_TOPIC, OFF_KEYS[i]);
+      await new Promise(function(resolve) { setTimeout(resolve, 150); });
     }
   };
 
-  useEffect(() => {
+  useEffect(function() {
     if (!isAuthenticated) return;
-    let isMounted = true;
 
-    const listenForUpdates = async () => {
-      abortControllerRef.current = new AbortController();
-      try {
-        // FIX 1: Poll using SUB_TOPIC ('otto7') instead of PUB_TOPIC ('innsub5')
-        const res = await fetch(`${API_BASE_URL}/latest-updates?topic=${encodeURIComponent(SUB_TOPIC)}`, {
-          signal: abortControllerRef.current.signal
-        });
+    const socket = io(getSocketUrl(API_BASE_URL), {
+      secure: true,
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000
+    });
 
-        if (res.status === 401 || res.status === 403) {
-          logout(true);
-          return;
-        }
+    socket.on('connect', function() {
+      socket.emit('join_board', SUB_TOPIC);
+      sendSecureCommand(PUB_TOPIC, "0");
+    });
 
-        const data = await res.json();
-        if (!isMounted) return;
-
+    socket.on('board_update', function(data) {
+      if (data.status) {
         setBoardStatus(data.status);
-        if (data.updates && data.updates.length > 0) {
-          setDeviceStates(prev => {
-            const newState = [...prev];
-            data.updates.forEach(msg => {
-              const onIdx = ON_KEYS.indexOf(msg);
-              const offIdx = OFF_KEYS.indexOf(msg);
-              if (onIdx !== -1) newState[onIdx] = true;
-              if (offIdx !== -1) newState[offIdx] = false;
-            });
+      }
+
+      let msg = data.message || data;
+      if (typeof msg === 'object' && msg !== null && msg.message) {
+        msg = msg.message;
+      }
+
+      if (typeof msg === 'string') {
+        const onIdx = ON_KEYS.indexOf(msg);
+        const offIdx = OFF_KEYS.indexOf(msg);
+
+        if (onIdx !== -1 || offIdx !== -1) {
+          setDeviceStates(function(prev) {
+            const newState = prev.slice();
+            if (onIdx !== -1) newState[onIdx] = true;
+            if (offIdx !== -1) newState[offIdx] = false;
             return newState;
           });
         }
-        
-        // Immediate next poll if connection closes normally
-        if (isMounted) listenForUpdates();
-      } catch (err) {
-        if (isMounted && err.name !== 'AbortError') {
-          setTimeout(listenForUpdates, 3000);
-        }
       }
-    };
+    });
 
-    // Send initial status request command
-    sendSecureCommand(PUB_TOPIC, "0");
-    listenForUpdates();
-
-    return () => {
-      isMounted = false;
-      if (abortControllerRef.current) abortControllerRef.current.abort();
+    return function() {
+      socket.disconnect();
     };
   }, [isAuthenticated]);
 
-  const login = async (e) => {
+  const login = async function(e) {
     e.preventDefault();
     setErrorMsg('');
     try {
-      // FIX 2: Pass boardId so server evaluates MASTER_PASS_BOARD2
-      const res = await fetch(`${API_BASE_URL}/login`, {
+      const res = await fetch(API_BASE_URL + '/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          password,
-          boardId: 'otto7'
+          password: password,
+          boardId: SUB_TOPIC 
         })
       });
       const data = await res.json();
@@ -140,97 +131,99 @@ function App() {
       } else {
         setErrorMsg(data.error || 'Invalid Master Password');
       }
-    } catch (err) { setErrorMsg("Auth Server Offline"); }
+    } catch (err) { 
+      setErrorMsg("Auth Server Offline"); 
+    }
   };
 
-  const handleToggle = (i) => {
+  const handleToggle = function(i) {
     if (boardStatus === 'offline') return;
-    const newState = !deviceStates[i];
-    setDeviceStates(prev => { const n = [...prev]; n[i] = newState; return n; });
-    sendSecureCommand(PUB_TOPIC, newState ? ON_KEYS[i] : OFF_KEYS[i]);
+    const currentState = deviceStates[i];
+    sendSecureCommand(PUB_TOPIC, currentState ? OFF_KEYS[i] : ON_KEYS[i]);
   };
 
-  if (!isAuthenticated) {
-    return (
-      <div className="app-viewport">
-        <div className="glass-shell login-panel">
-          <h1 className="main-logo">KAMEHA</h1>
-          {errorMsg && (
-            <div style={{
-              background: 'rgba(255, 77, 77, 0.15)',
-              color: '#ff4d4d',
-              padding: '10px',
-              borderRadius: '8px',
-              marginBottom: '15px',
-              fontSize: '0.85rem',
-              border: '1px solid rgba(255, 77, 77, 0.3)',
-              textAlign: 'center',
-              width: '100%'
-            }}>
-              {errorMsg}
-            </div>
-          )}
-          <form onSubmit={login} className="login-form">
-            <input 
-              type="password" 
-              placeholder="MASTER PASS" 
-              className="m-btn login-input"
-              value={password} 
-              onChange={(e) => setPassword(e.target.value)}
-            />
-            <button type="submit" className="m-btn login-submit">ACCESS</button>
-          </form>
-        </div>
-      </div>
+  const renderLoginView = function() {
+    return React.createElement('div', { className: 'app-viewport' },
+      React.createElement('div', { className: 'glass-shell login-panel' },
+        React.createElement('h1', { className: 'main-logo' }, 'KAMEHA'),
+        errorMsg ? React.createElement('div', {
+          style: {
+            background: 'rgba(255, 77, 77, 0.15)',
+            color: '#ff4d4d',
+            padding: '10px',
+            borderRadius: '8px',
+            marginBottom: '15px',
+            fontSize: '0.85rem',
+            border: '1px solid rgba(255, 77, 77, 0.3)',
+            textAlign: 'center',
+            width: '100%'
+          }
+        }, errorMsg) : null,
+        React.createElement('form', { onSubmit: login, className: 'login-form' },
+          React.createElement('input', {
+            type: 'password',
+            placeholder: 'MASTER PASS',
+            className: 'm-btn login-input',
+            value: password,
+            onChange: function(e) { setPassword(e.target.value); }
+          }),
+          React.createElement('button', { type: 'submit', className: 'm-btn login-submit' }, 'ACCESS')
+        )
+      )
     );
-  }
+  };
 
-  return (
-    <div className="app-viewport">
-      <div className="glass-shell">
-        <header className="header-section">
-          <div className="logo-row" onClick={() => logout(false)} style={{cursor: 'pointer'}}>
-            <div className={`status-pill ${boardStatus}`}></div>
-            <h1 className="main-logo">KAMEHA</h1>
-          </div>
-        </header>
+  const renderDashboardView = function() {
+    return React.createElement('div', { className: 'app-viewport' },
+      React.createElement('div', { className: 'glass-shell' },
+        React.createElement('header', { className: 'header-section' },
+          React.createElement('div', { 
+            className: 'logo-row', 
+            onClick: function() { logout(false); }, 
+            style: { cursor: 'pointer' } 
+          },
+            React.createElement('div', { className: 'status-pill ' + boardStatus }),
+            React.createElement('h1', { className: 'main-logo' }, 'KAMEHA')
+          )
+        ),
+        React.createElement('div', { className: 'master-controls', style: { display: 'flex', gap: '10px', marginBottom: '20px' } },
+          React.createElement('button', {
+            onClick: allOn,
+            className: 'm-btn',
+            style: { flex: 1, padding: '12px' },
+            disabled: boardStatus === 'offline'
+          }, 'ALL ON'),
+          React.createElement('button', {
+            onClick: allOff,
+            className: 'm-btn',
+            style: { flex: 1, padding: '12px' },
+            disabled: boardStatus === 'offline'
+          }, 'ALL OFF')
+        ),
+        React.createElement('div', { className: 'grid-container ' + boardStatus },
+          deviceStates.map(function(isOn, i) {
+            const iconName = isOn ? 'bright-light-bulb-svgrepo-com.svg' : 'light-bulb-svgrepo-com.svg';
+            const tileName = 'Light 0' + (i + 1);
+            
+            return React.createElement('button', {
+              key: i,
+              className: 'tile ' + (isOn ? 'on' : ''),
+              onClick: function() { handleToggle(i); }
+            },
+              React.createElement('img', {
+                src: baseUrl + iconName,
+                alt: 'icon'
+              }),
+              React.createElement('div', { className: 'tile-info' },
+                React.createElement('span', { className: 't-name' }, tileName),
+                React.createElement('span', { className: 't-status' }, isOn ? 'ACTIVE' : 'IDLE')
+              )
+            );
+          })
+        )
+      )
+    );
+  };
 
-        <div className="master-controls" style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
-          <button 
-            onClick={allOn} 
-            className="m-btn" 
-            style={{ flex: 1, padding: '12px' }}
-            disabled={boardStatus === 'offline'}
-          >
-            ALL ON
-          </button>
-          <button 
-            onClick={allOff} 
-            className="m-btn" 
-            style={{ flex: 1, padding: '12px' }}
-            disabled={boardStatus === 'offline'}
-          >
-            ALL OFF
-          </button>
-        </div>
-
-        <div className={`grid-container ${boardStatus}`}>
-          {deviceStates.map((isOn, i) => (
-            <button key={i} className={`tile ${isOn ? 'on' : ''}`} onClick={() => handleToggle(i)}>
-              <img 
-                src={`${baseUrl}${isOn ? 'bright-light-bulb-svgrepo-com.svg' : 'light-bulb-svgrepo-com.svg'}`} 
-                alt="icon" 
-              />
-              <div className="tile-info">
-                <span className="t-name">{`Light 0${i + 1}`}</span>
-                <span className="t-status">{isOn ? 'ACTIVE' : 'IDLE'}</span>
-              </div>
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
+  return isAuthenticated ? renderDashboardView() : renderLoginView();
 }
-
-export default App;
